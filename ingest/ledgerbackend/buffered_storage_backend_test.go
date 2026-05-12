@@ -13,6 +13,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
+	"github.com/stretchr/testify/require"
 
 	"github.com/stellar/go-stellar-sdk/support/compressxdr"
 	"github.com/stellar/go-stellar-sdk/support/datastore"
@@ -90,7 +91,7 @@ func createMockdataStore(t *testing.T, start, end, partitionSize, count uint32) 
 			readCloser = createLCMBatchReader(i, i, count)
 			objectName = fmt.Sprintf("FFFFFFFF--0-%d/%08X--%d.xdr.zstd", partition, math.MaxUint32-i, i)
 		}
-		mockDataStore.On("GetFile", mock.Anything, objectName).Return(readCloser, nil).Times(1)
+		mockDataStore.On("GetFile", mock.Anything, objectName).Return(readCloser, int64(-1), nil).Times(1)
 	}
 
 	t.Cleanup(func() {
@@ -119,6 +120,12 @@ func createTestLedgerCloseMetaBatch(startSeq, endSeq, count uint32) xdr.LedgerCl
 		EndSequence:      xdr.Uint32(endSeq),
 		LedgerCloseMetas: ledgerCloseMetas,
 	}
+}
+
+func decodeLedgerCloseMetaBatch(data []byte) (xdr.LedgerCloseMetaBatch, error) {
+	var batch xdr.LedgerCloseMetaBatch
+	err := xdr.SafeUnmarshal(data, &batch)
+	return batch, err
 }
 
 func createLCMBatchReader(start, end, count uint32) io.ReadCloser {
@@ -184,7 +191,11 @@ func TestNewLedgerBufferSizeLessThanRangeSize(t *testing.T) {
 	assert.NoError(t, err)
 
 	for i := startLedger; i <= endLedger; i++ {
-		lcm, err := ledgerBuffer.getFromLedgerQueue(context.Background())
+		compressed, err := ledgerBuffer.getFromLedgerQueue(context.Background())
+		assert.NoError(t, err)
+		batchBytes, err := ledgerBuffer.decompress(compressed)
+		assert.NoError(t, err)
+		lcm, err := decodeLedgerCloseMetaBatch(batchBytes)
 		assert.NoError(t, err)
 		assert.Equal(t, xdr.Uint32(i), lcm.StartSequence)
 	}
@@ -206,7 +217,11 @@ func TestNewLedgerBufferSizeLargerThanRangeSize(t *testing.T) {
 	assert.NoError(t, err)
 
 	for i := startLedger; i <= endLedger; i++ {
-		lcm, err := ledgerBuffer.getFromLedgerQueue(context.Background())
+		compressed, err := ledgerBuffer.getFromLedgerQueue(context.Background())
+		assert.NoError(t, err)
+		batchBytes, err := ledgerBuffer.decompress(compressed)
+		assert.NoError(t, err)
+		lcm, err := decodeLedgerCloseMetaBatch(batchBytes)
 		assert.NoError(t, err)
 		assert.Equal(t, xdr.Uint32(i), lcm.StartSequence)
 	}
@@ -256,6 +271,73 @@ func TestBSBGetLedger_SingleLedgerPerFile(t *testing.T) {
 	assert.Equal(t, lcmArray[2], lcm)
 }
 
+func TestBSBGetLedgerRaw_SingleLedgerPerFile(t *testing.T) {
+	startLedger := uint32(3)
+	endLedger := uint32(5)
+	ctx := context.Background()
+	lcmArray := createLCMForTesting(startLedger, endLedger)
+	bsb := createBufferedStorageBackendForTesting()
+	ledgerRange := BoundedRange(startLedger, endLedger)
+
+	mockDataStore := createMockdataStore(t, startLedger, endLedger, partitionSize, ledgerPerFileCount)
+	bsb.dataStore = mockDataStore
+
+	assert.NoError(t, bsb.PrepareRange(ctx, ledgerRange))
+	assert.Eventually(t, func() bool { return len(bsb.ledgerBuffer.ledgerQueue) == 3 }, time.Second*5, time.Millisecond*50)
+
+	for i := startLedger; i <= endLedger; i++ {
+		rawBytes, err := bsb.GetLedgerRaw(ctx, i)
+		assert.NoError(t, err)
+		assert.NotEmpty(t, rawBytes)
+
+		// Verify raw bytes decode to the expected LedgerCloseMeta
+		var lcm xdr.LedgerCloseMeta
+		err = xdr.SafeUnmarshal(rawBytes, &lcm)
+		assert.NoError(t, err)
+		assert.Equal(t, lcmArray[i-startLedger], lcm)
+	}
+}
+
+// TestBSBGetLedger_IdempotentReRequest verifies that requesting the
+// most-recently-served sequence again returns the same ledger without
+// erroring or advancing state, matching CaptiveStellarCore's behavior.
+func TestBSBGetLedger_IdempotentReRequest(t *testing.T) {
+	startLedger := uint32(3)
+	endLedger := uint32(5)
+	ctx := context.Background()
+	lcmArray := createLCMForTesting(startLedger, endLedger)
+	bsb := createBufferedStorageBackendForTesting()
+	ledgerRange := BoundedRange(startLedger, endLedger)
+
+	mockDataStore := createMockdataStore(t, startLedger, endLedger, partitionSize, ledgerPerFileCount)
+	bsb.dataStore = mockDataStore
+
+	assert.NoError(t, bsb.PrepareRange(ctx, ledgerRange))
+	assert.Eventually(t, func() bool { return len(bsb.ledgerBuffer.ledgerQueue) == 3 }, time.Second*5, time.Millisecond*50)
+
+	// First call serves the ledger and advances state.
+	first, err := bsb.GetLedger(ctx, startLedger)
+	assert.NoError(t, err)
+	assert.Equal(t, lcmArray[0], first)
+
+	// Second call for the same sequence returns the same ledger without erroring.
+	second, err := bsb.GetLedger(ctx, startLedger)
+	assert.NoError(t, err)
+	assert.Equal(t, first, second)
+
+	// GetLedgerRaw on the same sequence is also idempotent.
+	rawBytes, err := bsb.GetLedgerRaw(ctx, startLedger)
+	assert.NoError(t, err)
+	var rawLCM xdr.LedgerCloseMeta
+	require.NoError(t, xdr.SafeUnmarshal(rawBytes, &rawLCM))
+	assert.Equal(t, first, rawLCM)
+
+	// Forward progress still works after re-requests.
+	next, err := bsb.GetLedger(ctx, startLedger+1)
+	assert.NoError(t, err)
+	assert.Equal(t, lcmArray[1], next)
+}
+
 func TestCloudStorageGetLedger_MultipleLedgerPerFile(t *testing.T) {
 	startLedger := uint32(6)
 	endLedger := uint32(17)
@@ -297,7 +379,7 @@ func TestBSBGetLedger_ErrorPreceedingLedger(t *testing.T) {
 	assert.Equal(t, lcmArray[0], lcm)
 
 	_, err = bsb.GetLedger(ctx, uint32(2))
-	assert.EqualError(t, err, "requested sequence preceeds current LedgerRange")
+	assert.EqualError(t, err, "requested sequence 2 precedes current LedgerRange [3, 5]")
 }
 
 func TestBSBGetLedger_NotPrepared(t *testing.T) {
@@ -322,10 +404,10 @@ func TestBSBGetLedger_SequenceNotInBatch(t *testing.T) {
 	assert.Eventually(t, func() bool { return len(bsb.ledgerBuffer.ledgerQueue) == 3 }, time.Second*5, time.Millisecond*50)
 
 	_, err := bsb.GetLedger(ctx, uint32(2))
-	assert.EqualError(t, err, "requested sequence preceeds current LedgerRange")
+	assert.EqualError(t, err, "requested sequence 2 precedes current LedgerRange [3, 5]")
 
 	_, err = bsb.GetLedger(ctx, uint32(6))
-	assert.EqualError(t, err, "requested sequence beyond current LedgerRange")
+	assert.EqualError(t, err, "requested sequence 6 beyond current LedgerRange [3, 5]")
 }
 
 func TestBSBPrepareRange(t *testing.T) {
@@ -435,7 +517,7 @@ func TestBSBClose(t *testing.T) {
 	assert.EqualError(t, err, "BufferedStorageBackend is closed; cannot GetLatestLedgerSequence")
 
 	_, err = bsb.GetLedger(ctx, 3)
-	assert.EqualError(t, err, "BufferedStorageBackend is closed; cannot GetLedger")
+	assert.EqualError(t, err, "BufferedStorageBackend is closed; cannot GetLedger or GetLedgerRaw")
 
 	err = bsb.PrepareRange(ctx, ledgerRange)
 	assert.EqualError(t, err, "BufferedStorageBackend is closed; cannot PrepareRange")
@@ -502,7 +584,7 @@ func TestLedgerBufferClose(t *testing.T) {
 
 	objectName := fmt.Sprintf("FFFFFFFF--0-%d/%08X--%d.xdr.zstd", partition, math.MaxUint32-3, 3)
 	afterPrepareRange := make(chan struct{})
-	mockDataStore.On("GetFile", mock.Anything, objectName).Return(io.NopCloser(&bytes.Buffer{}), context.Canceled).Run(func(args mock.Arguments) {
+	mockDataStore.On("GetFile", mock.Anything, objectName).Return(io.NopCloser(&bytes.Buffer{}), int64(-1), context.Canceled).Run(func(args mock.Arguments) {
 		<-afterPrepareRange
 		go bsb.ledgerBuffer.close()
 	}).Once()
@@ -533,7 +615,7 @@ func TestLedgerBufferBoundedObjectNotFound(t *testing.T) {
 	partition := ledgerPerFileCount*partitionSize - 1
 
 	objectName := fmt.Sprintf("FFFFFFFF--0-%d/%08X--%d.xdr.zstd", partition, math.MaxUint32-3, 3)
-	mockDataStore.On("GetFile", mock.Anything, objectName).Return(io.NopCloser(&bytes.Buffer{}), os.ErrNotExist).Once()
+	mockDataStore.On("GetFile", mock.Anything, objectName).Return(io.NopCloser(&bytes.Buffer{}), int64(0), os.ErrNotExist).Once()
 	t.Cleanup(func() {
 		mockDataStore.AssertExpectations(t)
 	})
@@ -563,7 +645,7 @@ func TestLedgerBufferUnboundedObjectNotFound(t *testing.T) {
 	objectName := fmt.Sprintf("FFFFFFFF--0-%d/%08X--%d.xdr.zstd", partition, math.MaxUint32-3, 3)
 	iteration := &atomic.Int32{}
 	cancelAfter := int32(bsb.config.RetryLimit) + 2
-	mockDataStore.On("GetFile", mock.Anything, objectName).Return(io.NopCloser(&bytes.Buffer{}), os.ErrNotExist).Run(func(args mock.Arguments) {
+	mockDataStore.On("GetFile", mock.Anything, objectName).Return(io.NopCloser(&bytes.Buffer{}), int64(0), os.ErrNotExist).Run(func(args mock.Arguments) {
 		if iteration.Load() >= cancelAfter {
 			cancel()
 		}
@@ -594,7 +676,7 @@ func TestLedgerBufferRetryLimit(t *testing.T) {
 
 	objectName := fmt.Sprintf("FFFFFFFF--0-%d/%08X--%d.xdr.zstd", partition, math.MaxUint32-3, 3)
 	mockDataStore.On("GetFile", mock.Anything, objectName).
-		Return(io.NopCloser(&bytes.Buffer{}), fmt.Errorf("transient error")).
+		Return(io.NopCloser(&bytes.Buffer{}), int64(-1), fmt.Errorf("transient error")).
 		Times(int(bsb.config.RetryLimit) + 1)
 	t.Cleanup(func() {
 		mockDataStore.AssertExpectations(t)
