@@ -9,11 +9,12 @@ import (
 	"github.com/stellar/go-stellar-sdk/xdr"
 )
 
-// WithMetrics decorates the given LedgerBackend with metrics
-func WithMetrics(base LedgerBackend, registry *prometheus.Registry, namespace string) LedgerBackend {
-	if captiveCoreBackend, ok := base.(*CaptiveStellarCore); ok {
-		captiveCoreBackend.registerMetrics(registry, namespace)
-	}
+// newLedgerFetchDurationSummary builds and registers the
+// ledger_fetch_duration_seconds summary. Shared by WithMetrics (the GetLedger
+// path) and the LedgerStream implementations (the RawLedgers path) so both
+// emit the identical metric — a consumer keeps the same dashboard whichever
+// ingestion API it uses.
+func newLedgerFetchDurationSummary(registry *prometheus.Registry, namespace string) prometheus.Summary {
 	summary := prometheus.NewSummary(
 		prometheus.SummaryOpts{
 			Namespace: namespace, Subsystem: "ingest", Name: "ledger_fetch_duration_seconds",
@@ -22,9 +23,17 @@ func WithMetrics(base LedgerBackend, registry *prometheus.Registry, namespace st
 		},
 	)
 	registry.MustRegister(summary)
+	return summary
+}
+
+// WithMetrics decorates the given LedgerBackend with metrics
+func WithMetrics(base LedgerBackend, registry *prometheus.Registry, namespace string) LedgerBackend {
+	if captiveCoreBackend, ok := base.(*CaptiveStellarCore); ok {
+		captiveCoreBackend.registerMetrics(registry, namespace)
+	}
 	return metricsLedgerBackend{
 		LedgerBackend:              base,
-		ledgerFetchDurationSummary: summary,
+		ledgerFetchDurationSummary: newLedgerFetchDurationSummary(registry, namespace),
 	}
 }
 
@@ -41,18 +50,4 @@ func (m metricsLedgerBackend) GetLedger(ctx context.Context, sequence uint32) (x
 	}
 	m.ledgerFetchDurationSummary.Observe(time.Since(startTime).Seconds())
 	return lcm, nil
-}
-
-// GetLedgerRaw is a passthrough to the wrapped backend, recording the same
-// ledgerFetchDurationSummary as GetLedger — both code paths are "fetches"
-// from the backend's perspective; the latency profile is dominated by I/O,
-// not by the marshal step.
-func (m metricsLedgerBackend) GetLedgerRaw(ctx context.Context, sequence uint32) ([]byte, error) {
-	startTime := time.Now()
-	raw, err := m.LedgerBackend.GetLedgerRaw(ctx, sequence)
-	if err != nil {
-		return nil, err
-	}
-	m.ledgerFetchDurationSummary.Observe(time.Since(startTime).Seconds())
-	return raw, nil
 }
