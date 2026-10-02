@@ -98,6 +98,20 @@ func (c *Client) GetEvents(ctx context.Context,
 	return result, nil
 }
 
+// QueryEvents calls the queryEvents method. The method is experimental and
+// only served by rpcv2 nodes; an rpcv1 node returns a JSON-RPC
+// method-not-found error (code -32601).
+func (c *Client) QueryEvents(ctx context.Context,
+	request protocol.QueryEventsRequest,
+) (protocol.QueryEventsResponse, error) {
+	var result protocol.QueryEventsResponse
+	err := c.callResult(ctx, protocol.QueryEventsMethodName, request, &result)
+	if err != nil {
+		return protocol.QueryEventsResponse{}, err
+	}
+	return result, nil
+}
+
 // GetFeeStats returns statistics about network fees, including percentile data
 // for both Soroban and classic transactions. Use this to estimate appropriate
 // fees for transaction submission.
